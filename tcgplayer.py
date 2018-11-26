@@ -1,25 +1,41 @@
+#!/usr/bin/env python3
+
+import bisect
 import copy
 import math
 import operator
 import requests
 
-from bisect import bisect_left
 from collections import defaultdict
 from functools import reduce
 
-ACCESS_TOKEN = 'xEodnIqwY2Ak0ncn_cQrr48e4vIJCaewaD8ZXX0ehtAoxc14h7NOOclwik2Yjs5pXoRKQXs2XhZZ8tlJoy_Zd23z51Gf9cbF5lmC66CmO-EQo1qVHsLEHcQkq-qAVPpFQw-54dyWQPHIvoPamb9l1ZBAutLxXyj2QAbcI_s55FX-km7UJaVCdYd-NyYjJ4_3BX4I2tkKBYDzat0-AumVMX1fQT3M9PnzEAvtJ5VBagJj66EedoGP3qDyCq32XNdCJomp_-oyld1nRNGqKlusEA3k8wCOfjAGZASFxvIKUtxy5MVK_cTmowGK5sYH4jZnLjCKDA' # noqa
-ROUND_MULTIPLIER = 100
-TRANSFORM_ACCURACY = 1E+4
-MAX_TRANSFORM_SIZE = 5E+6
+from sortedcontainers import SortedDict, SortedList
+
+ACCESS_TOKEN='oVnFSf4f-YoXhzrctn_PyOaFW7WdmSXfSg4LzlkcTG8RbEeWQlQtKHaxpHBDaH4p8Cf_HkL8EL35nrCwgx-ZJw4UN0tPLJFaXszub4JqK3gZBUf6qvVHq0ckNZ8ah-kWrd1VdoK7hMUmngfdEeiMipCwWyK7ZyEc8rHJGIiI_rEv92UQeiJQT3-u2lnW-xQbvghdiOVieqW--ekKIaca7XAGTJ_uP7awUSIruTyrYuQF9HwYx_LImIopuUFmos8aKmjGCuvqqT3lAeg-GqDFzx8GZS03EdyJHCglksEybwWs1R4yzDDWtQUH7LzT7FtyJ385KA'  # noqa
+MAX_TRANSFORM_SIZE = 1E+6
+
+
+def get_access_token():
+    global ACCESS_TOKEN
+
+    response = requests.post("https://api.tcgplayer.com/token",
+                             headers={
+                                 "Content-Type": "application/json",
+                                 "Accept": "application/json"},
+                             data="grant_type=client_credentials&client_id=D1694E24-A9F3-4AF4-8340-5A7C51AA02CC&client_secret=7A9F54EF-5EF6-4398-B2E8-AE7FC3488F3E")  # noqa
+
+    ACCESS_TOKEN = response.json()['access_token']
+    print(ACCESS_TOKEN)
 
 
 def make_request(endpoint, data=None):
-    # print(endpoint, data)
-    response = requests.get(f"https://api.tcgplayer.com{endpoint}",
+    print(f"https://api.tcgplayer.com/v1.17.0{endpoint}", data)
+    response = requests.get(f"https://api.tcgplayer.com/v1.17.0{endpoint}",
                             headers={
                                 "Accept": "application/json",
                                 "Authorization": f"bearer {ACCESS_TOKEN}"},
                             data=data)
+    print(response.text)
     return response.json()
 
 
@@ -57,6 +73,12 @@ def get_cards(setId):
                            f"groupId={setId}&getExtendedFields=true")
 
 
+def get_cards_with_pricing(setId):
+    cards = get_all_results("/catalog/products",
+                            f"groupId={setId}&getExtendedFields=true")
+    return add_pricing_to_cards(cards)
+
+
 def get_rarity(card):
     for data in card['extendedData']:
         if data['displayName'] == 'Rarity':
@@ -65,7 +87,7 @@ def get_rarity(card):
 
 
 def add_pricing_to_cards(cards):
-    PROCESS_PER_RUN = 100
+    PROCESS_PER_RUN = 37
     card_id_dict = {card['productId']: card for card in cards}
     card_ids = [str(card_id) for card_id in card_id_dict.keys()]
 
@@ -78,6 +100,8 @@ def add_pricing_to_cards(cards):
         pricings = make_request("/pricing/product/{}".format(','.join(to_process)))
 
         for pricing in pricings['results']:
+            if pricing['marketPrice'] is None or pricing['midPrice'] is None:
+                continue
             if pricing['subTypeName'] == 'Normal':
                 card_id = pricing['productId']
                 if card_id in card_id_dict and card_id not in processed_ids:
@@ -104,7 +128,8 @@ def has_normal_rarity(card):
         return get_rarity(card) in ['C', 'U', 'R', 'M']
 
 
-def round_dist(dist, round_to=ROUND_MULTIPLIER):
+# @profile  # noqa
+def round_dist(dist, round_to=100):
     if not dist:
         return [(0, 1)]
     result_dict = defaultdict(float)
@@ -115,60 +140,103 @@ def round_dist(dist, round_to=ROUND_MULTIPLIER):
     return sorted(((x / round_to, y) for x, y in result_dict.items()), key=lambda x: x[0])
 
 
-def transform_distributions(transform, *distributions):
-    distributions_sorted = sorted(enumerate(distributions), key=lambda x: len(x[1]), reverse=True)
-    multipliers = list(ROUND_MULTIPLIER for _ in distributions)
+# @profile  # noqa
+def trim_dist(dist, max_size):
+    dist = round_dist(dist, 10)
+
+    indexes = SortedList(i for i, x in sorted(enumerate(dist), key=lambda x: x[1][1])[:-max_size])
+    bad_values = SortedList(dist[x][0] for x in indexes)
+    bad_weights = list(dist[x][1] for x in indexes)
+
+    result_dict = SortedDict(x for x in dist if x[0] not in bad_values)
+
+    for value, weight in zip(bad_values, bad_weights):
+        index = result_dict.bisect(value)
+
+        closest_above = None
+        closest_below = None
+        try:
+            closest_above = result_dict.iloc[index]
+        except:
+            pass
+        try:
+            closest_below = result_dict.iloc[index - 1]
+        except:
+            pass
+
+        if (closest_above is not None) and \
+                ((closest_below is None) or abs(value - closest_above) < abs(value - closest_below)):
+            result_value = closest_above
+        elif closest_below is not None:
+            result_value = closest_below
+        else:
+            print("BROKEN", len(bad_values), value, index, len(result_dict))
+            print(result_dict)
+            raise Exception("Could not find a closest value to trim from")
+
+        result_weight = result_dict[result_value]
+
+        final_value = (result_weight * result_value + weight * value) / (result_weight + weight)
+        if final_value in result_dict and final_value != result_value:
+            result_dict[final_value] += result_weight + weight
+        else:
+            result_dict[final_value] = result_weight + weight
+
+        if final_value != result_value:
+            del result_dict[result_value]
+    return round_dist(sorted(((x, y) for x, y in result_dict.items()), key=lambda x: x[0]), 10)
+
+
+# @profile  # noqa
+def sum_distributions(*distributions):
     prev_sizes = list(len(x) for x in distributions)
-    prev_averages = list(sum(list(x * y for x, y in dist)) for dist in distributions)
-    dist_size = reduce(operator.mul, (len(x[1]) for x in distributions_sorted))
+    # prev_averages = list(sum(list(x * y for x, y in dist)) for dist in distributions)
+    dist_size = reduce(operator.mul, (len(x) for x in distributions))
     print_final_dist = False
     start_size = dist_size
-    while dist_size > MAX_TRANSFORM_SIZE:
-        index, dist = distributions_sorted[0]
-        mult = multipliers[index] = multipliers[index] / 2
-        dist = round_dist(dist, mult)
-
-        distributions_sorted[0] = (index, dist)
-        distributions_sorted = sorted(distributions_sorted, key=lambda x: len(x[1]), reverse=True)
-        dist_size = reduce(operator.mul, (len(x[1]) for x in distributions_sorted))
-
-    distributions = list(x[1] for x in sorted(distributions_sorted, key=lambda x: x[0]))
-    if print_final_dist:
+    if dist_size > MAX_TRANSFORM_SIZE:
+        relative_size = MAX_TRANSFORM_SIZE / dist_size
+        per_dist_relative = relative_size ** (1 / len(distributions))
+        # print(per_dist_relative, "trimming per dist required")
+        distributions = list(trim_dist(dist, int(len(dist) * per_dist_relative)) for dist in distributions)
+    dist_size = reduce(operator.mul, (len(x) for x in distributions))
+    if print_final_dist and start_size != dist_size:
+        prev_averages = None
         for i, dist in enumerate(distributions):
-            new_average = sum(list(x * y for x, y in dist))
-            print("Reduced dist", i, "from size", prev_sizes[i], "to", len(dist),
-                  "With average value change", prev_averages[i], "to", new_average,
-                  "Which percentagewise is", 100 * new_average / prev_averages[i],
-                  "New multiplier is", multipliers[i])
+            if prev_sizes[i] != len(dist):
+                new_average = sum(list(x * y for x, y in dist))
+                if prev_averages[i] - new_average > 0.01:
+                    print("Reduced dist", i, "from size", prev_sizes[i], "to", len(dist),
+                          "With average value change", prev_averages[i], "to", new_average,
+                          "Which is", prev_averages[i] - new_average,
+                          "Which percentagewise is",
+                          100 * new_average / prev_averages[i] if prev_averages[i] > 0 else "inf")
         print("Started at size", start_size, "Final distributions are size", dist_size, "with sizes",
-              list(len(x) for x in distributions), "and multipliers", multipliers)
+              list(len(x) for x in distributions))
 
     result_values = defaultdict(float)
+    max_index = len(distributions)
 
-    def recursive_transform(fixed_args, result_weight, remaining_distributions):
-        if remaining_distributions:
-            for card, weight in remaining_distributions[0]:
-                recursive_transform([*fixed_args, card],
+    # @profile  # noqa
+    def recursive_transform(result_key=0, result_weight=1, index=0):
+        if index < max_index:
+            for value, weight in distributions[index]:
+                recursive_transform(result_key + value,
                                     result_weight * weight,
-                                    remaining_distributions[1:])
+                                    index + 1)
         else:
-            result_key = int(transform(*fixed_args) * ROUND_MULTIPLIER)
             result_values[result_key] += result_weight
 
-    recursive_transform([], 1, distributions)
-    min_prob = 1 / len(result_values) / TRANSFORM_ACCURACY
+    recursive_transform()
 
-    average_value = sum(list(x * y for x, y in result_values.items())) / ROUND_MULTIPLIER
-    values_list = list((x / ROUND_MULTIPLIER, y) for x, y in result_values.items() if y > min_prob)
-    corrected_average_value = sum(list(x * y for x, y in values_list))
-    if average_value - corrected_average_value > 0.01:
-        print("POST TRIM", corrected_average_value, average_value, average_value - corrected_average_value,
-              100 * corrected_average_value / average_value if average_value > 0 else 0)
+    min_prob = 1 / len(result_values) / 1000
+
+    values_list = list((x, y) for x, y in result_values.items() if y > min_prob)
     values_list.append((0, 1 - sum(list(x[1] for x in values_list))))
     return sorted(values_list, key=lambda x: x[0])
 
 
-def repeat_transform_n(transform, n, distribution):
+def dist_times_n(n, distribution):
         auxilary = None
         # print(n)
         while n > 1:
@@ -176,15 +244,15 @@ def repeat_transform_n(transform, n, distribution):
                 if auxilary is None:
                     auxilary = distribution
                 else:
-                    auxilary = transform_distributions(transform, distribution, auxilary)
-            distribution = transform_distributions(transform, distribution, distribution)
+                    auxilary = sum_distributions(distribution, auxilary)
+            distribution = sum_distributions(distribution, distribution)
             n = n // 2
             # print(n)
 
         if auxilary is None:
             return distribution
         else:
-            return transform_distributions(transform, auxilary, distribution)
+            return sum_distributions(auxilary, distribution)
 
 
 def print_stat_info(cards, designation):
@@ -198,8 +266,8 @@ def print_stat_info(cards, designation):
 
     cards_value = sum(card * weight for card, weight in cards)
     cards_std_dev = math.sqrt(sum(weight * (card - cards_value)**2 for card, weight in cards))
-    cards_rel_std_dev = cards_std_dev / cards_value
-    cards_deciles = list(cards[min(bisect_left(cumulative_sum, i / 10), cards_count - 1)][0] for i in range(11))
+    cards_rel_std_dev = cards_std_dev / cards_value if cards_value > 0 else 0
+    cards_deciles = list(cards[min(bisect.bisect_left(cumulative_sum, i / 10), cards_count - 1)][0] for i in range(11))
 
     print(designation, "Average:", f"${cards_value:.2f}")
     print(designation, "StdDev:", f"${cards_std_dev:.2f}")
@@ -241,14 +309,14 @@ def print_pack_value_x_and_over(commons, uncommons, rares, mythics, threshold, f
                        if card['pricing'][pricing] >= threshold)
     commons_pre.append((0, 1 - sum(list(weight for card, weight in commons_pre))))
     commons_pre = sorted(commons_pre, key=lambda x: x[0])
-    commons_values = repeat_transform_n(lambda *args: sum(args), COMMONS_PER_PACK, commons_pre)
+    commons_values = dist_times_n(COMMONS_PER_PACK, commons_pre)
 
     uncommons_pre = list((card['pricing'][pricing], 1 / uncommons_count)
                          for card in uncommons
                          if card['pricing'][pricing] >= threshold)
     uncommons_pre.append((0, 1 - sum(list(weight for card, weight in uncommons_pre))))
     uncommons_pre = sorted(uncommons_pre, key=lambda x: x[0])
-    uncommons_values = repeat_transform_n(lambda *args: sum(args), UNCOMMONS_PER_PACK, uncommons_pre)
+    uncommons_values = dist_times_n(UNCOMMONS_PER_PACK, uncommons_pre)
 
     rare_slot = list((card['pricing'][pricing], RARES_PER_PACK / rares_count)
                      for card in rares
@@ -263,7 +331,11 @@ def print_pack_value_x_and_over(commons, uncommons, rares, mythics, threshold, f
     foils_value.append((0, 1 - sum(list(weight for card, weight in foils_value))))
     foils_value = sorted(foils_value, key=lambda x: x[0])
 
-    pack = transform_distributions(lambda *args: sum(args), commons_values, uncommons_values, rare_slot, foils_value)
+    pack_1 = sum_distributions(commons_values, uncommons_values)
+    print_stat_info(pack_1, f"Common/Uncommon slots(${threshold:.2f} and over only) {source}")
+
+    pack_2 = sum_distributions(rare_slot, foils_value)
+    pack = sum_distributions(pack_1, pack_2)
 
     print_stat_info(pack, f"Pack(${threshold:.2f} and over only) {source}")
 
@@ -320,8 +392,8 @@ def print_expected_pack_value(setId, foil_rarity=1 / 6):
     if foil_rarity > 0:
         foils_mid = create_foil_distribution(commons, uncommons, rares, mythics, foil_rarity, mid=True)
         foils_market = create_foil_distribution(commons, uncommons, rares, mythics, foil_rarity, mid=False)
-        print_stat_info(foils_mid, "Foils Mid")
-        print_stat_info(foils_market, "Foils Market")
+        print_stat_info(foils_mid, "Foil Slot Mid")
+        print_stat_info(foils_market, "Foil Slot Market")
 
     rares_count = len(rares)
     mythics_count = len(mythics)
@@ -331,14 +403,14 @@ def print_expected_pack_value(setId, foil_rarity=1 / 6):
                         list((card['pricing']['midPrice'], MYTHICS_PER_PACK / mythics_count)
                              for card in mythics),
                         key=lambda x: x[0])
-    print_stat_info(values_mid, "Pack(Rare/Mythic only) Mid")
+    print_stat_info(values_mid, "Rare Slot Mid")
 
     values_market = sorted(list((card['pricing']['marketPrice'], RARES_PER_PACK / rares_count)
                                 for card in rares) +
                            list((card['pricing']['marketPrice'], MYTHICS_PER_PACK / mythics_count)
                                 for card in mythics),
                            key=lambda x: x[0])
-    print_stat_info(values_market, "Pack(Rare/Mythic only) Market")
+    print_stat_info(values_market, "Rare Slot Market")
 
     pack_mid_50 = print_pack_value_x_and_over(commons, uncommons, rares, mythics, 0.50, foils_mid, mid=True)
     pack_market_50 = print_pack_value_x_and_over(commons, uncommons, rares, mythics, 0.50, foils_market, mid=False)
@@ -355,12 +427,22 @@ def print_expected_pack_value(setId, foil_rarity=1 / 6):
 def get_box_price(setId, packs_per_box=36, foil_rarity=1 / 6):
     dists = print_expected_pack_value(setId, foil_rarity=foil_rarity)
 
-    box_mid_50 = repeat_transform_n(lambda *args: sum(args), packs_per_box, dists['pack_mid_50'])
+    box_mid_50 = dist_times_n(packs_per_box, dists['pack_mid_50'])
     print_stat_info(box_mid_50, "Box Mid($0.50 and over only)")
-    box_market_50 = repeat_transform_n(lambda *args: sum(args), packs_per_box, dists['pack_market_50'])
+    box_market_50 = dist_times_n(packs_per_box, dists['pack_market_50'])
     print_stat_info(box_market_50, "Box Market($0.50 and over only)")
 
-    box_mid_2 = repeat_transform_n(lambda *args: sum(args), packs_per_box, dists['pack_mid_2'])
+    box_mid_2 = dist_times_n(packs_per_box, dists['pack_mid_2'])
     print_stat_info(box_mid_2, "Box Mid($2.00 and over only)")
-    box_market_2 = repeat_transform_n(lambda *args: sum(args), packs_per_box, dists['pack_market_2'])
+    box_market_2 = dist_times_n(packs_per_box, dists['pack_market_2'])
     print_stat_info(box_market_2, "Box Market($2.00 and over only)")
+
+
+def get_total_value(cards):
+    return \
+        {
+            'regular_mid': sum([card['pricing']['midPrice'] for card in cards]),
+            'regular_market': sum([card['pricing']['marketPrice'] for card in cards]),
+            'foil_mid': sum([card['foilPricing']['midPrice'] for card in cards]),
+            'foil_market': sum([card['foilPricing']['marketPrice'] for card in cards]),
+        }
